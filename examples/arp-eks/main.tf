@@ -9,7 +9,7 @@ locals {
   region = "ap-east-1"
 
   vpc_cidr = "172.16.0.0/16"
-  azs      = slice(data.aws_availability_zones.available.names, 0, 3)
+  azs = ["ap-east-1a", "ap-east-1b", "ap-east-1c"]
 
   tags = {
     Environment  = "POC"
@@ -30,62 +30,61 @@ module "eks" {
   cluster_name    = "arp-airflow-poc-eks"
   cluster_version = "1.24"
 
-  cluster_endpoint_public_access = {
-    type        = bool
-    default     = false
-  }
-  cluster_endpoint_private_access = {
-    type        = bool
-    default     = true
-  }
+  cluster_endpoint_public_access = false
+  cluster_endpoint_private_access = true
 
   # EKS Addons
   cluster_addons = {
     coredns    = {}
     kube-proxy = {}
     vpc-cni    = {}
-    enable_airflow = true
-    airflow_helm_config = {
-      name             = "airflow"
-      chart            = "airflow"
-      repository       = "https://airflow.apache.org"
-      version          = "2.5.1"
-      namespace        = module.airflow_irsa.namespace
-      create_namespace = false
-      timeout          = 360
-      description      = "Apache Airflow v2 Helm chart deployment configuration"
-      # Check the example for `values.yaml` file
-      values = [templatefile("${path.module}/values.yaml", {
-        # Airflow Postgres RDS Config
-        airflow_db_user = "airflow"
-        airflow_db_name = module.db.db_instance_name
-        airflow_db_host = element(split(":", module.db.db_instance_endpoint), 0)
-        # S3 bucket config for Logs
-        s3_bucket_name          = aws_s3_bucket.this.id
-        webserver_secret_name   = local.airflow_webserver_secret_name
-        airflow_service_account = local.airflow_service_account
-      })]
+  }
+  /*
+  map_roles_count = 1
+  map_roles = [
+    {
+      rolearn  = aws_iam_role.bastion_iam_role.arn
+      username = "kubectl"
+      groups   = ["system:masters"]
+    },
+  ]
+  eks_managed_node_group_defaults = {
+    iam_role_additional_policies = {
+      # access the nodes to inspect mounted volumes
+      AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    }
+  }
+  */
+  vpc_id     = aws_vpc.this.id
+  subnet_ids = aws_subnet.eks[*].id
 
-      set_sensitive = [
-        {
-          name  = "data.metadataConnection.pass"
-          value = data.aws_secretsmanager_secret_version.postgres.secret_string
-        }
-      ]
+    eks_managed_node_groups = {
+    eks-worker-node = {
+      instance_types = ["t3.medium"]
+      min_size     = 2
+      max_size     = 3
+      desired_size = 2
     }
   }
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  tags = local.tags
+}
 
-  eks_managed_node_groups = {
-    name         = "arp-airflow-poc-eks-node-group"
-    instance_types = ["t3.small"]
-    min_size     = 2
-    max_size     = 3
-    desired_size = 2
-  }
+################################################################################
+# Kubernetes Addons
+################################################################################
 
+module "eks_blueprints_kubernetes_addons" {
+  source = "../../modules/kubernetes-addons"
+
+  eks_cluster_id       = module.eks.cluster_name
+  eks_cluster_endpoint = module.eks.cluster_endpoint
+  eks_oidc_provider    = module.eks.oidc_provider
+  eks_cluster_version  = module.eks.cluster_version
+
+  # Add-ons
+  enable_airflow = true
+  
   tags = local.tags
 }
 
@@ -93,88 +92,303 @@ module "eks" {
 # Supporting Resources
 ################################################################################
 
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 3.0"
-
-  name = local.name
-  cidr = local.vpc_cidr
-
-  azs             = local.azs
-  private_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 4, k)]
-
-  enable_nat_gateway   = false
-  single_nat_gateway   = true
+resource "aws_vpc" "this" {
+  tags = merge(
+    local.tags,
+    {
+      Name = "arp-airflow-poc-vpc"
+    },
+  )
+  cidr_block = local.vpc_cidr
+  instance_tenancy     = "default"
+  enable_dns_support = true
   enable_dns_hostnames = true
+}
 
-  # Manage so we can name
-  manage_default_network_acl    = true
-  default_network_acl_tags      = { Name = "${local.name}-default" }
-  manage_default_route_table    = true
-  default_route_table_tags      = { Name = "${local.name}-default" }
-  manage_default_security_group = true
-  default_security_group_tags   = { Name = "${local.name}-default" }
+resource "aws_subnet" "public" {
+  count = length(var.public_subnet_cidrs)
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = "${local.azs[count.index]}"
+  map_public_ip_on_launch = true
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-public-subnet"
+    },
+  )
+}
 
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
+resource "aws_subnet" "file" {
+  count = length(var.file_subnet_cidrs)
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.file_subnet_cidrs[count.index]
+  availability_zone       = "${local.azs[count.index]}"
+  map_public_ip_on_launch = false
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-file-subnet-${local.azs[count.index]}"
+    },
+  )
+}
+
+resource "aws_subnet" "db" {
+  count = length(var.db_subnet_cidrs)
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.db_subnet_cidrs[count.index]
+  availability_zone       = "${local.azs[count.index]}"
+  map_public_ip_on_launch = false
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-db-subnet-${local.azs[count.index]}"
+    },
+  )
+}
+
+resource "aws_subnet" "eks" {
+  count = length(var.db_subnet_cidrs)
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.eks_subnet_cidrs[count.index]
+  availability_zone       = "${local.azs[count.index]}"
+  map_public_ip_on_launch = false
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-eks-subnet-${local.azs[count.index]}"
+    },
+  )
+}
+
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.this.id
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-internet-gateway"
+    },
+  )
+}
+
+resource "aws_route_table" "public_rt" {
+ vpc_id = aws_vpc.this.id
+ route {
+   cidr_block = "0.0.0.0/0"
+   gateway_id = aws_internet_gateway.gw.id
+ }
+ tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-public-subnet-route-table"
+    },
+  )
+}
+resource "aws_route_table_association" "public_subnet_asso" {
+ count = length(var.public_subnet_cidrs)
+ subnet_id      = element(aws_subnet.public[*].id, count.index)
+ route_table_id = aws_route_table.public_rt.id
+}
+
+# Charges may occur
+# Reserve EIPs
+resource "aws_eip" "nat" {
+  vpc = true
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-nat-eip"
+    },
+  )
+}
+
+resource "aws_nat_gateway" "zone_a" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-nat-gateway"
+    },
+  )
+  depends_on = [
+    aws_subnet.public
+  ]
+}
+
+resource "aws_route_table" "file_rt" {
+ vpc_id = aws_vpc.this.id
+ route {
+   cidr_block = "0.0.0.0/0"
+   gateway_id = aws_nat_gateway.zone_a.id
+ }
+ tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-file-subnet-route-table"
+    },
+  )
+}
+resource "aws_route_table_association" "file_subnet_asso" {
+ count = length(var.file_subnet_cidrs)
+ subnet_id      = element(aws_subnet.file[*].id, count.index)
+ route_table_id = aws_route_table.file_rt.id
+}
+
+resource "aws_route_table" "db_rt" {
+ vpc_id = aws_vpc.this.id
+ route {
+   cidr_block = "0.0.0.0/0"
+   gateway_id = aws_nat_gateway.zone_a.id
+ }
+ tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-db-subnet-route-table"
+    },
+  )
+}
+resource "aws_route_table_association" "db_subnet_asso" {
+ count = length(var.db_subnet_cidrs)
+ subnet_id      = element(aws_subnet.db[*].id, count.index)
+ route_table_id = aws_route_table.db_rt.id
+}
+
+resource "aws_route_table" "eks_rt" {
+ vpc_id = aws_vpc.this.id
+ route {
+   cidr_block = "0.0.0.0/0"
+   gateway_id = aws_nat_gateway.zone_a.id
+ }
+ tags = merge(
+    local.tags,
+    {
+      Name = "${local.name}-eks-subnet-route-table"
+    },
+  )
+}
+resource "aws_route_table_association" "eks_subnet_asso" {
+ count = length(var.eks_subnet_cidrs)
+ subnet_id      = element(aws_subnet.eks[*].id, count.index)
+ route_table_id = aws_route_table.eks_rt.id
+}
+
+# Create Bastion EC2 at Public Subnet
+# Generates a secure private key and encodes it as PEM
+resource "tls_private_key" "key_pair" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+# Create the Key Pair
+resource "aws_key_pair" "key_pair" {
+  key_name   = "${local.name}-key-pair"
+  public_key = tls_private_key.key_pair.public_key_openssh
+}
+# Save file
+resource "local_file" "ssh_key" {
+  filename = "${aws_key_pair.key_pair.key_name}.pem"
+  content  = tls_private_key.key_pair.private_key_pem
+}
+# security group of Bastion
+resource "aws_security_group" "bastion_sg" {
+  name        = "${local.name}-bastion-sg"
+  description = "Allow incoming traffic to the Linux EC2 Instance"
+  vpc_id      = aws_vpc.this.id
+  ingress {
+    description = "Allow incoming HTTP connections"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
-
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow incoming SSH connections"
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
   tags = local.tags
 }
-
-module "vpc_endpoints_sg" {
-  source  = "terraform-aws-modules/security-group/aws"
-  version = "~> 4.0"
-
-  name        = "${local.name}-vpc-endpoints"
-  description = "Security group for VPC endpoint access"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress_with_cidr_blocks = [
-    {
-      rule        = "https-443-tcp"
-      description = "VPC CIDR HTTPS"
-      cidr_blocks = join(",", module.vpc.private_subnets_cidr_blocks)
-    },
-  ]
-
-  egress_with_cidr_blocks = [
-    {
-      rule        = "https-443-tcp"
-      description = "All egress HTTPS"
-      cidr_blocks = "0.0.0.0/0"
-    },
-  ]
-
-  tags = local.tags
+# IAM role for Bastion
+resource "aws_iam_instance_profile" "test" {
+  name = "${local.name}-instance-profile"
+  role = aws_iam_role.bastion_iam_role.name
 }
-
-module "vpc_endpoints" {
-  source  = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
-  version = "~> 3.0"
-
-  vpc_id             = module.vpc.vpc_id
-  security_group_ids = [module.vpc_endpoints_sg.security_group_id]
-
-  endpoints = merge({
-    s3 = {
-      service         = "s3"
-      service_type    = "Gateway"
-      route_table_ids = module.vpc.private_route_table_ids
-      tags = {
-        Name = "${local.name}-s3"
-      }
+data "aws_iam_policy_document" "assume_role" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
     }
+    actions = ["sts:AssumeRole"]
+  }
+}
+resource "aws_iam_role" "bastion_iam_role" {
+  name               = "${local.name}-bastion-iam-role"
+  path               = "/"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.bastion_iam_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+data "aws_iam_policy_document" "eks" {
+  statement {
+    effect    = "Allow"
+    actions   = [
+                "eks:DescribeCluster",
+                "eks:ListClusters"
+                ]
+    resources = ["*"]
+  }
+}
+resource "aws_iam_policy" "eks" {
+  name        = "${local.name}-eks-policy"
+  description = "A eks policy"
+  policy      = data.aws_iam_policy_document.eks.json
+}
+resource "aws_iam_role_policy_attachment" "eks" {
+  role       = aws_iam_role.bastion_iam_role.name
+  policy_arn = aws_iam_policy.eks.arn
+}
+# launch Bastion
+data "aws_ami" "amazon-linux-2" {
+ most_recent = true
+ filter {
+   name   = "owner-alias"
+   values = ["amazon"]
+ }
+ filter {
+   name   = "name"
+   values = ["amzn2-ami-hvm*"]
+ }
+}
+resource "aws_instance" "test" {
+ ami                         = "${data.aws_ami.amazon-linux-2.id}"
+ associate_public_ip_address = true
+ iam_instance_profile        = "${aws_iam_instance_profile.test.id}"
+ instance_type               = "t3.micro"
+ key_name                    = aws_key_pair.key_pair.key_name
+ vpc_security_group_ids      = ["${aws_security_group.bastion_sg.id}"]
+ subnet_id                   = aws_subnet.public[0].id
+ root_block_device {
+    volume_size           = 8
+    volume_type           = "gp2"
+    delete_on_termination = true
+    encrypted             = true
+  }
+  tags = merge(
+    local.tags,
+    {
+      Name = "arp-airflow-poc-bastion-ec2"
     },
-    { for service in toset(["autoscaling", "ecr.api", "ecr.dkr", "ec2", "ec2messages", "elasticloadbalancing", "sts", "kms", "logs", "ssm", "ssmmessages"]) :
-      replace(service, ".", "_") =>
-      {
-        service             = service
-        subnet_ids          = module.vpc.private_subnets
-        private_dns_enabled = true
-        tags                = { Name = "${local.name}-${service}" }
-      }
-  })
-
-  tags = local.tags
+  )
 }
